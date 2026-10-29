@@ -1,0 +1,7 @@
+# Ignorar los ejecutables compilados
+knn
+knn.exe
+
+# Ignorar los archivos de datos binarios de MNIST (son muy pesados)
+*-ubyte
+*.gz
