@@ -78,9 +78,12 @@ float euclidean_distance_sq_simd(const float* img1, const float* img2, size_t nu
     return dist;
 }
 
-// =========================================================================
+
+
 // 1. DYNAMIC SCHEDULING
-// =========================================================================
+
+
+
 double test_dynamic(const DatasetSoA& train, const DatasetSoA& test, int k, int samples, int threads) {
     omp_set_num_threads(threads);
     int correct = 0;
@@ -102,9 +105,12 @@ double test_dynamic(const DatasetSoA& train, const DatasetSoA& test, int k, int 
     return elapsed.count();
 }
 
-// =========================================================================
+
+
 // 2. STATIC SCHEDULING
-// =========================================================================
+
+
+
 double test_static(const DatasetSoA& train, const DatasetSoA& test, int k, int samples, int threads) {
     omp_set_num_threads(threads);
     int correct = 0;
@@ -126,9 +132,13 @@ double test_static(const DatasetSoA& train, const DatasetSoA& test, int k, int s
     return elapsed.count();
 }
 
-// =========================================================================
+
+
+
 // 3. GUIDED SCHEDULING
-// =========================================================================
+
+
+
 double test_guided(const DatasetSoA& train, const DatasetSoA& test, int k, int samples, int threads) {
     omp_set_num_threads(threads);
     int correct = 0;
