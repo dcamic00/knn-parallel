@@ -226,8 +226,9 @@ int main() {
         read_mnist_labels(test_labels_path, test_data);
         
         // Comparativa directa de rendimiento
-        evaluate_knn_sequential(train_data, test_data, 5, 1000);
-        evaluate_knn_parallel(train_data, test_data, 5, 1000);
+        // Modificado a 10000 para procesar todo el dataset de prueba
+        evaluate_knn_sequential(train_data, test_data, 5, 10000);
+        evaluate_knn_parallel(train_data, test_data, 5, 10000);
         
     } catch (const std::exception& e) {
         std::cerr << "Excepción: " << e.what() << std::endl;
