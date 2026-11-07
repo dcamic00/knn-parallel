@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <omp.h>
+#include <iomanip>
 
 uint32_t swap_endian(uint32_t val) {
     return ((val << 24) & 0xff000000) |
@@ -68,6 +69,8 @@ void read_mnist_labels(const std::string& full_path, DatasetSoA& dataset) {
     }
 }
 
+// ---------------- DISTANCIAS Y SIMD ----------------
+
 float euclidean_distance_sq_simd(const float* img1, const float* img2, size_t num_features) {
     float dist = 0.0f;
     #pragma omp simd reduction(+:dist)
@@ -78,85 +81,84 @@ float euclidean_distance_sq_simd(const float* img1, const float* img2, size_t nu
     return dist;
 }
 
-
-
-// 1. DYNAMIC SCHEDULING
-
-
-
-double test_dynamic(const DatasetSoA& train, const DatasetSoA& test, int k, int samples, int threads) {
-    omp_set_num_threads(threads);
-    int correct = 0;
-    auto start = std::chrono::high_resolution_clock::now();
-
-    #pragma omp parallel for reduction(+:correct) schedule(dynamic)
-    for (int i = 0; i < samples; ++i) {
-        const float* current_test_img = &test.all_features[i * test.num_features];
-        std::vector<std::pair<float, uint8_t>> distances(train.num_samples);
-
-        for (size_t j = 0; j < train.num_samples; ++j) {
-            float dist = euclidean_distance_sq_simd(current_test_img, &train.all_features[j * train.num_features], train.num_features);
-            distances[j] = {dist, train.labels[j]};
-        }
-        std::partial_sort(distances.begin(), distances.begin() + k, distances.end(),
-                          [](const std::pair<float, uint8_t>& a, const std::pair<float, uint8_t>& b) { return a.first < b.first; });
+float cosine_distance_simd(const float* img1, const float* img2, size_t num_features) {
+    float dot = 0.0f, norm1 = 0.0f, norm2 = 0.0f;
+    #pragma omp simd reduction(+:dot, norm1, norm2)
+    for (size_t i = 0; i < num_features; ++i) {
+        dot += img1[i] * img2[i];
+        norm1 += img1[i] * img1[i];
+        norm2 += img2[i] * img2[i];
     }
-    std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
-    return elapsed.count();
+    if (norm1 == 0.0f || norm2 == 0.0f) return 1.0f; // Prevenir división por 0
+    return 1.0f - (dot / (std::sqrt(norm1) * std::sqrt(norm2)));
 }
 
+// ---------------- CLASIFICACIÓN (MAYORÍA) ----------------
 
-
-// 2. STATIC SCHEDULING
-
-
-
-double test_static(const DatasetSoA& train, const DatasetSoA& test, int k, int samples, int threads) {
-    omp_set_num_threads(threads);
-    int correct = 0;
-    auto start = std::chrono::high_resolution_clock::now();
-
-    #pragma omp parallel for reduction(+:correct) schedule(static)
-    for (int i = 0; i < samples; ++i) {
-        const float* current_test_img = &test.all_features[i * test.num_features];
-        std::vector<std::pair<float, uint8_t>> distances(train.num_samples);
-
-        for (size_t j = 0; j < train.num_samples; ++j) {
-            float dist = euclidean_distance_sq_simd(current_test_img, &train.all_features[j * train.num_features], train.num_features);
-            distances[j] = {dist, train.labels[j]};
-        }
-        std::partial_sort(distances.begin(), distances.begin() + k, distances.end(),
-                          [](const std::pair<float, uint8_t>& a, const std::pair<float, uint8_t>& b) { return a.first < b.first; });
+uint8_t get_majority_vote(const std::vector<std::pair<float, uint8_t>>& k_nearest, int k) {
+    int counts[10] = {0};
+    for (int i = 0; i < k; ++i) {
+        counts[k_nearest[i].second]++;
     }
-    std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
-    return elapsed.count();
+    uint8_t best_label = 0;
+    int max_count = -1;
+    for (int i = 0; i < 10; ++i) {
+        if (counts[i] > max_count) {
+            max_count = counts[i];
+            best_label = i;
+        }
+    }
+    return best_label;
 }
 
+enum DistanceMetric { EUCLIDEAN, COSINE };
 
+// ---------------- RUTINA PRINCIPAL EVALUACIÓN ----------------
 
-
-// 3. GUIDED SCHEDULING
-
-
-
-double test_guided(const DatasetSoA& train, const DatasetSoA& test, int k, int samples, int threads) {
+double run_knn_evaluation(const DatasetSoA& train, const DatasetSoA& test, int k, int samples, 
+                          int threads, omp_sched_t sched, DistanceMetric metric, double& out_accuracy) {
+    
     omp_set_num_threads(threads);
+    omp_set_schedule(sched, 0); // 0 deja que OpenMP decida el chunk_size óptimo por defecto
+    
     int correct = 0;
     auto start = std::chrono::high_resolution_clock::now();
 
-    #pragma omp parallel for reduction(+:correct) schedule(guided)
-    for (int i = 0; i < samples; ++i) {
-        const float* current_test_img = &test.all_features[i * test.num_features];
+    // Declaramos el entorno paralelo para todo el bucle
+    #pragma omp parallel reduction(+:correct)
+    {
+        // IMPORTANTE: Instanciar la memoria de distancias UNA SOLA VEZ por hilo.
+        // Hacerlo dentro del for mata el rendimiento por culpa de re-allocations masivas.
         std::vector<std::pair<float, uint8_t>> distances(train.num_samples);
 
-        for (size_t j = 0; j < train.num_samples; ++j) {
-            float dist = euclidean_distance_sq_simd(current_test_img, &train.all_features[j * train.num_features], train.num_features);
-            distances[j] = {dist, train.labels[j]};
+        #pragma omp for schedule(runtime)
+        for (int i = 0; i < samples; ++i) {
+            const float* current_test_img = &test.all_features[i * test.num_features];
+
+            for (size_t j = 0; j < train.num_samples; ++j) {
+                float dist;
+                if (metric == EUCLIDEAN) {
+                    dist = euclidean_distance_sq_simd(current_test_img, &train.all_features[j * train.num_features], train.num_features);
+                } else {
+                    dist = cosine_distance_simd(current_test_img, &train.all_features[j * train.num_features], train.num_features);
+                }
+                distances[j].first = dist;
+                distances[j].second = train.labels[j];
+            }
+            
+            // Ordenación parcial para obtener los K mejores
+            std::partial_sort(distances.begin(), distances.begin() + k, distances.end(),
+                              [](const std::pair<float, uint8_t>& a, const std::pair<float, uint8_t>& b) { return a.first < b.first; });
+            
+            uint8_t predicted_label = get_majority_vote(distances, k);
+            if (predicted_label == test.labels[i]) {
+                correct++;
+            }
         }
-        std::partial_sort(distances.begin(), distances.begin() + k, distances.end(),
-                          [](const std::pair<float, uint8_t>& a, const std::pair<float, uint8_t>& b) { return a.first < b.first; });
     }
+    
     std::chrono::duration<double> elapsed = std::chrono::high_resolution_clock::now() - start;
+    out_accuracy = (static_cast<double>(correct) / samples) * 100.0;
     return elapsed.count();
 }
 
@@ -174,40 +176,73 @@ int main() {
         read_mnist_labels(test_labels_path, test_data);
         
         int samples = 10000;
-        int k = 5;
-        int optimal_threads = 8; // Fijado segun tu mejor resultado
+        int optimal_threads = 8;
+        int num_runs = 5; // Requisito: Mínimo 5 ejecuciones
+        double accuracy = 0.0;
         
-        std::ofstream csv_file("scheduling_results.csv");
-        csv_file << "Schedule_Type,Time_Seconds\n";
-
-        std::cout << "\nIniciando comparativa de Scheduling OpenMP con " << optimal_threads << " hilos..." << std::endl;
+        std::cout << "\n1. Evaluacion de Precision (Accuracy) con K=1, 5, 10" << std::endl;
+        std::cout << "--------------------------------------------------------" << std::endl;
+        int ks[] = {1, 5, 10};
         
-        // 1. Dynamic
-        std::cout << "-> Probando schedule(dynamic)... ";
-        double t_dyn = 0;
-        for(int r=0; r<3; r++) t_dyn += test_dynamic(train_data, test_data, k, samples, optimal_threads);
-        t_dyn /= 3.0;
-        std::cout << t_dyn << " seg" << std::endl;
-        csv_file << "dynamic," << t_dyn << "\n";
+        for (int k : ks) {
+            run_knn_evaluation(train_data, test_data, k, samples, optimal_threads, omp_sched_static, EUCLIDEAN, accuracy);
+            std::cout << "K=" << std::left << std::setw(2) << k << " | Euclidiana | Accuracy: " << accuracy << "%" << std::endl;
+            
+            run_knn_evaluation(train_data, test_data, k, samples, optimal_threads, omp_sched_static, COSINE, accuracy);
+            std::cout << "K=" << std::left << std::setw(2) << k << " | Coseno     | Accuracy: " << accuracy << "%" << std::endl;
+        }
 
-        // 2. Static
-        std::cout << "-> Probando schedule(static)... ";
-        double t_stat = 0;
-        for(int r=0; r<3; r++) t_stat += test_static(train_data, test_data, k, samples, optimal_threads);
-        t_stat /= 3.0;
-        std::cout << t_stat << " seg" << std::endl;
-        csv_file << "static," << t_stat << "\n";
-
-        // 3. Guided
-        std::cout << "-> Probando schedule(guided)... ";
-        double t_gui = 0;
-        for(int r=0; r<3; r++) t_gui += test_guided(train_data, test_data, k, samples, optimal_threads);
-        t_gui /= 3.0;
-        std::cout << t_gui << " seg" << std::endl;
-        csv_file << "guided," << t_gui << "\n";
+        std::cout << "\n2. Iniciando pruebas de Scheduling OpenMP (k=5, 8 Hilos)..." << std::endl;
+        std::ofstream sched_file("scheduling_results.csv");
+        sched_file << "Schedule_Type,Time_Seconds\n";
         
-        csv_file.close();
-        std::cout << "\nPruebas de Scheduling terminadas. Guardado en 'scheduling_results.csv'" << std::endl;
+        omp_sched_t schedules[] = {omp_sched_static, omp_sched_dynamic, omp_sched_guided};
+        std::string sched_names[] = {"static", "dynamic", "guided"};
+        
+        for (int i = 0; i < 3; i++) {
+            std::cout << "-> Probando schedule(" << sched_names[i] << ")... ";
+            double t_total = 0;
+            
+            // Warm-up run (descartamos primera ejecucion)
+            run_knn_evaluation(train_data, test_data, 5, samples, optimal_threads, schedules[i], EUCLIDEAN, accuracy);
+            
+            for(int r = 0; r < num_runs; r++) {
+                t_total += run_knn_evaluation(train_data, test_data, 5, samples, optimal_threads, schedules[i], EUCLIDEAN, accuracy);
+            }
+            double t_avg = t_total / num_runs;
+            std::cout << t_avg << " seg" << std::endl;
+            sched_file << sched_names[i] << "," << t_avg << "\n";
+        }
+        sched_file.close();
+        std::cout << "Pruebas de Scheduling terminadas. ('scheduling_results.csv')" << std::endl;
+
+
+        std::cout << "\n3. Iniciando pruebas de Escalabilidad Fuerte (Strong Scaling)..." << std::endl;
+        std::ofstream scale_file("scaling_results.csv");
+        scale_file << "Threads,Time,Speedup\n";
+        
+        int thread_counts[] = {1, 2, 4, 8, 16};
+        double base_time = 0.0;
+        
+        for (int t : thread_counts) {
+            std::cout << "-> Ejecutando con " << t << " hilos... ";
+            double t_total = 0;
+            
+            // Warm-up
+            run_knn_evaluation(train_data, test_data, 5, samples, t, omp_sched_static, EUCLIDEAN, accuracy);
+            
+            for(int r = 0; r < num_runs; r++) {
+                t_total += run_knn_evaluation(train_data, test_data, 5, samples, t, omp_sched_static, EUCLIDEAN, accuracy);
+            }
+            double t_avg = t_total / num_runs;
+            
+            if (t == 1) base_time = t_avg; // Tomamos el primer run como base de speedup (secuencial puro requeriria quitar pragmas, pero esto da una buena metrica)
+            
+            std::cout << t_avg << " seg | Speedup: " << base_time / t_avg << "x" << std::endl;
+            scale_file << t << "," << t_avg << "," << base_time / t_avg << "\n";
+        }
+        scale_file.close();
+        std::cout << "Pruebas de Escalabilidad terminadas. ('scaling_results.csv')" << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Excepcion: " << e.what() << std::endl;
